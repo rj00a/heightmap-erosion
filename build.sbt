@@ -1,4 +1,4 @@
-val scala3Version = "3.0.0-RC1"
+val scala3Version = "3.0.0-RC2"
 
 lazy val root = project
   .in(file("."))
@@ -10,7 +10,7 @@ lazy val root = project
 
     scalacOptions ++= Seq(
       "-Yexplicit-nulls",
-      "-Ycheck-init",
+      "-Ysafe-init",
       "-deprecation",
       "-feature",
       "-indent",
@@ -19,6 +19,4 @@ lazy val root = project
       "-Xfatal-warnings",
       "-Xmigration" 
     ),
-
-    libraryDependencies += "com.novocode" % "junit-interface" % "0.11" % "test"
   )

@@ -1,32 +1,39 @@
 import scala.annotation.tailrec
-import scala.util.Random.{nextDouble, nextFloat, nextLong}
+import scala.util.Random.{nextLong, nextFloat}
 import scala.collection.immutable.ArraySeq
 import scala.math.Ordering.Float.TotalOrdering
+import scala.concurrent.{ExecutionContext, Future, Await}
+import scala.concurrent.duration.Duration
 
+import java.util.concurrent.Executors
 import java.awt.image.{BufferedImage, DataBufferUShort}
 import java.io.File
 import javax.imageio.ImageIO
 
-import Math.{min, max, hypot, floorMod}
+import Math.{min, max, hypot, floorMod, sin, cos, PI, exp}
 import System.currentTimeMillis
 
-def main(args: Array[String]): Unit =
-  val sizeX = 500
-  val sizeY = 500
+val numCpus = Runtime.getRuntime.nn.availableProcessors()
 
+def main(args: Array[String]): Unit =
+  // Run the erosion algorithm on a heightmap initialized with fractal noise.
+  // Save the initial and resulting heightmaps to PNG files.
+
+  val sizeX = 1024
+  val sizeY = 1024
   var heightMap = Array.fill(sizeX * sizeY)(0f)
+
+  val es = Executors.newFixedThreadPool(numCpus).nn
+  implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(es)
 
   val noise = OpenSimplexNoise(nextLong())
 
-  // Initialize the heightmap.
   for x <- 0 until sizeX; y <- 0 until sizeY do
-    //val h = 1 - smoothstep(hypot(x - sizeX / 2, y - sizeY / 2), 0, min(sizeX, sizeY) / 4)
-    //heightMap(x + y * sizeX) = (h * 0.9 + 0.1).toFloat
-    val n = fractalize(x * 0.01, y * 0.01, noise.eval(_, _), 10)
+    val n = fractalize(x * 0.003f, y * 0.003f, noise.eval(_, _).toFloat, 10)
     heightMap(x + y * sizeX) = (n.toFloat + 1) / 2
 
   val image = BufferedImage(sizeX, sizeY, BufferedImage.TYPE_USHORT_GRAY)
-  val imageData = image.getRaster.getDataBuffer.asInstanceOf[DataBufferUShort].getData.nn
+  val imageData = image.getRaster.nn.getDataBuffer.asInstanceOf[DataBufferUShort].getData.nn
 
   def copyHeightMap(): Unit =
     val minHeight = heightMap.min
@@ -42,15 +49,20 @@ def main(args: Array[String]): Unit =
 
   val startTime = currentTimeMillis()
 
-  heightMap = hydraulicErosion(
+  heightMap = erodeHeightMap(
     heightMap,
-    sizeX,
-    sizeY,
-    iterations = 100,
-    rainRate = 0.01,
-    soluability = 0.01,
-    evaporation = 0.5,
-    sedimentCapCoeff = 0.01
+    sizeX = sizeX,
+    sizeY = sizeY,
+    iterations = 512,
+    cellSize = 200f / max(sizeX, sizeY),
+    rainRate = 0.0004f,
+    evaporationRate = 0.0005f,
+    minHeightDelta = 0.05f,
+    gravity = 30f,
+    dissolveRate = 0.25f,
+    depositionRate = 0.001f,
+    sedimentCapCoeff = 50f,
+    reposeSlope = 0.05f,
   )
 
   val endTime = currentTimeMillis()
@@ -62,173 +74,209 @@ def main(args: Array[String]): Unit =
   ImageIO.write(image, "png", afterFile)
 
   println(f"Erosion took ${(endTime - startTime) / 1000.0}%.2fs")
-
-def smoothstep(x: Double, edge0: Double, edge1: Double): Double =
-  val n = clamp((x - edge0) / (edge1 - edge0), 0, 1)
-  n * n * (3 - 2 * n)
-
-def clamp(x: Double, min: Double, max: Double): Double =
-  if x < min then min
-  else if x > max then max
-  else x
+  assert(es.shutdownNow().nn.size == 0)
 
 def fractalize(
-  x: Double,
-  y: Double,
-  f: (Double, Double) => Double,
+  x: Float,
+  y: Float,
+  f: (Float, Float) => Float,
   octaves: Int = 1,
-  lacunarity: Double = 2,
-  persistence: Double = 0.5,
+  lacunarity: Float = 2f,
+  persistence: Float = 0.5f,
 ): Double =
   @tailrec
-  def loop(o: Int, l: Double, p: Double, d: Double, s: Double): Double =
+  def loop(o: Int, l: Float, p: Float, d: Float, s: Float): Float =
     if o < octaves then
       loop(o + 1, l * lacunarity, p * persistence, d + p, s + f(x * l, y * l) * p)
     else s / d
   loop(0, 1, 1, 0, 0)
 
-def b2i(b: Boolean): 0 | 1 = if b then 1 else 0
+def lerp(a: Float, b: Float, t: Float): Float =
+  a * (1 - t) + b * t
 
-// Hashing stuff for randomized precipitation amounts.
-def hash(x: Long): Long =
-  val x1 = (x ^ (x >>> 30)) * 0xbf58476d1ce4e5b9L
-  val x2 = (x1 ^ (x1 >>> 27)) * 0x94d049bb133111ebL
-  x2 ^ (x2 >>> 31)
+def bilerp(v00: Float, v10: Float, v01: Float, v11: Float, tx: Float, ty: Float): Float =
+  lerp(lerp(v00, v10, tx), lerp(v01, v11, tx), ty)
 
-def hashCombine(l: Long, r: Long): Long =
-  l ^ (r + 0x9e3779b97f4a7c16L + (l << 6) + (l >>> 2))
+def gaussBlurFn(x: Float, y: Float, sigma: Float): Float =
+  val sigmaSq2 = sigma * sigma * 2
+  1 / (PI.toFloat * sigmaSq2) * exp(-(x * x + y * y) / sigmaSq2).toFloat
 
-def hydraulicErosion(
+// The actual erosion code.
+def erodeHeightMap(
   heightMap: Array[Float],
   sizeX: Int,
   sizeY: Int,
   iterations: Int,
+  cellSize: Float,
   rainRate: Float,
-  soluability: Float,
-  evaporation: Float,
-  sedimentCapCoeff: Float
-): Array[Float] =
-
-  var terrain = heightMap
-  var terrainAfter = Array.fill(sizeX * sizeY)(0f)
-  var water = terrainAfter.clone
-  var waterAfter = terrainAfter.clone
-  var sediment = terrainAfter.clone
-  var sedimentAfter = terrainAfter.clone
+  evaporationRate: Float,
+  minHeightDelta: Float,
+  gravity: Float,
+  dissolveRate: Float,
+  depositionRate: Float,
+  sedimentCapCoeff: Float,
+  reposeSlope: Float,
+)(implicit ec: ExecutionContext): Array[Float] =
 
   def get(a: Array[Float], x: Int, y: Int): Float =
     a(floorMod(x, sizeX) + floorMod(y, sizeY) * sizeX)
 
   def set(a: Array[Float], x: Int, y: Int, v: Float): Unit =
-    a(floorMod(x, sizeX) + floorMod(y, sizeY) * sizeX) = max(0, v)
+    a(floorMod(x, sizeX) + floorMod(y, sizeY) * sizeX) = v
 
-  case class Outflow(
-    w0: Float,
-    s0: Float,
-    w1: Float,
-    s1: Float,
-    w2: Float,
-    s2: Float,
-    w3: Float,
-    s3: Float
-  )
+  def parallel2d(f: (Int, Int) => Unit): Unit =
+    val chunk = sizeX * sizeY / numCpus
+    val fut = Future.sequence(
+      for i <- 1 to numCpus yield Future {
+        for j <- chunk * (i - 1) until chunk * i do
+          f(j % sizeX, j / sizeX)
+      }
+    )
+    for i <- chunk * numCpus until sizeX * sizeY do
+      f(i % sizeX, i / sizeX)
+    Await.ready(fut, Duration.Inf)
 
-  // Determine the water and sediment outflow from a cell in the cardinal
-  // directions at the current time.
-  def cellOutflow(x: Int, y: Int): Outflow =
-    val h = get(terrain, x, y)
-    val w = get(water, x, y)
-    val s = get(sediment, x, y)
+  var terrain = heightMap
+  var terrain2 = Array.fill(sizeX * sizeY)(0f)
+  var water = terrain2.clone
+  var water2 = terrain2.clone
+  var sediment = terrain2.clone
+  var sediment2 = terrain2.clone
+  val speed = terrain2.clone
+  val gradientX = terrain2.clone
+  val gradientY = terrain2.clone
 
-    // Total altutude for a cell is the sum of its terrain height and water.
-    val a = h + w
+  val weightMatrixSize = 5
+  val blurWeightMatrix =
+    val matrix =
+      for y <- 0 until weightMatrixSize; x <- 0 until weightMatrixSize
+      yield gaussBlurFn(
+        (x - weightMatrixSize / 2).toFloat,
+        (y - weightMatrixSize / 2).toFloat,
+        1
+      )
+    val sum = matrix.sum
+    ArraySeq.from(matrix.map(_ / sum))
 
-    val a0 = get(terrain, x, y + 1) + get(water, x, y + 1)
-    val a1 = get(terrain, x - 1, y) + get(water, x - 1, y)
-    val a2 = get(terrain, x + 1, y) + get(water, x + 1, y)
-    val a3 = get(terrain, x, y - 1) + get(water, x, y - 1)
+  // Gets a value in the array at the given coords using bilinear interpolation.
+  def sample(a: Array[Float], x: Float, y: Float): Float =
+    val ix = x.floor.toInt
+    val iy = y.floor.toInt
+    bilerp(
+      get(a, ix, iy),
+      get(a, ix + 1, iy),
+      get(a, ix, iy + 1),
+      get(a, ix + 1, iy + 1),
+      x - ix,
+      y - iy
+    )
 
-    // Only account for the neighboring cells that have an altitude less than
-    // the current cell altitude.
-    val aAvg =
-      (a + a0 * b2i(a > a0) + a1 * b2i(a > a1) + a2 * b2i(a > a2) + a3 * b2i(a > a3)) /
-      (1 + b2i(a > a0) + b2i(a > a1) + b2i(a > a2) + b2i(a > a3))
+  for iter <- 1 to iterations do
+    parallel2d { (x, y) =>
+      set(water, x, y, get(water, x, y) + rainRate * cellSize * cellSize)
 
-    val d0 = max(0, aAvg - a0)
-    val d1 = max(0, aAvg - a1)
-    val d2 = max(0, aAvg - a2)
-    val d3 = max(0, aAvg - a3)
+      val (gradX, gradY) =
+        val dx = get(terrain, x - 1, y) - get(terrain, x + 1, y)
+        val dy = get(terrain, x, y - 1) - get(terrain, x, y + 1)
+        val mag = hypot(dx, dy).toFloat
+        if mag < 1e-10 then
+          val angle = nextFloat() * PI * 2
+          (cos(angle).toFloat, sin(angle).toFloat)
+        else (dx / mag, dy / mag)
 
-    val dTotal = d0 + d1 + d2 + d3
+      set(gradientX, x, y, gradX)
+      set(gradientY, x, y, gradY)
 
-    val da = max(0, a - aAvg)
+      val oldHeight = get(terrain, x, y)
+      val newHeight = sample(terrain, x + gradX, y + gradY)
+      val heightDelta = oldHeight - newHeight
 
-    val (dw0, dw1, dw2, dw3) =
-      if dTotal == 0 then (0f, 0f, 0f, 0f) else
-        (
-          min(w, da) * (d0 / dTotal),
-          min(w, da) * (d1 / dTotal),
-          min(w, da) * (d2 / dTotal),
-          min(w, da) * (d3 / dTotal),
+      val sedimentCap =
+        max(heightDelta, minHeightDelta) / cellSize *
+        get(speed, x, y) *
+        get(water, x, y) *
+        sedimentCapCoeff
+
+      val depositedSediment =
+        val sed = get(sediment, x, y)
+        max(
+          -heightDelta,
+          if heightDelta < 0 then min(heightDelta, sed)
+          else if sed > sedimentCap then depositionRate * (sed - sedimentCap)
+          else dissolveRate * (sed - sedimentCap)
         )
 
-    val ds0 = s * (dw0 / w)
-    val ds1 = s * (dw1 / w)
-    val ds2 = s * (dw2 / w)
-    val ds3 = s * (dw3 / w)
+      set(sediment, x, y, get(sediment, x, y) - depositedSediment)
+      set(terrain2, x, y, get(terrain, x, y) + depositedSediment)
+      set(speed, x, y, gravity * heightDelta / cellSize)
+    }
 
-    assert(dw0 + dw1 + dw2 + dw3 < w + 0.00001, dw0 + dw1 + dw2 + dw3)
-    assert(ds0 + ds1 + ds2 + ds3 < s + 0.00001, ds0 + ds1 + ds2 + ds3)
-
-    Outflow(dw0, ds0, dw1, ds1, dw2, ds2, dw3, ds3)
-
-  for iter <- 0 until iterations do
-
-    // TODO: do this loop in parallel.
-    for x <- 0 until sizeX; y <- 0 until sizeY do
-      // Add water from precipitation and convert terrain into sediment.
-
-      //val hashPos = hashCombine(hash(floorMod(x, sizeX) + floorMod(y, sizeY) * sizeX), hash(iter))
-      //val w = get(water, x, y) + 0.00001f + hashPos.abs.toFloat / Long.MaxValue * rainRate
-      val w = get(water, x, y) + rainRate
-      assert(w > 0)
-      set(terrain, x, y, get(terrain, x, y) - w * soluability)
-      set(sediment, x, y, get(sediment, x, y) + w * soluability)
-      set(water, x, y, w)
-
-    // TODO: do this loop in parallel.
-    for x <- 0 until sizeX; y <- 0 until sizeY do
-      val o = cellOutflow(x, y)
-      val o0 = cellOutflow(x, y + 1)
-      val o1 = cellOutflow(x - 1, y)
-      val o2 = cellOutflow(x + 1, y)
-      val o3 = cellOutflow(x, y - 1)
+    // Transport water and sediment in the Moore neighborhood using the normalized gradient vectors.
+    parallel2d { (x, y) =>
+      val wrd = max(-get(gradientX, x + 1, y + 1), 0f) * max(-get(gradientY, x + 1, y + 1), 0f)
+      val wrm = max(-get(gradientX, x + 1, y), 0f) * max(1 - get(gradientY, x + 1, y).abs, 0f)
+      val wru = max(-get(gradientX, x + 1, y - 1), 0f) * max(get(gradientY, x + 1, y - 1), 0f)
+      val wmd = max(1 - get(gradientX, x, y + 1).abs, 0f) * max(-get(gradientY, x, y + 1), 0f)
+      val wmm = max(1 - get(gradientX, x, y).abs, 0f) * max(1 - get(gradientY, x, y).abs, 0f)
+      val wmu = max(1 - get(gradientX, x, y - 1).abs, 0f) * max(get(gradientY, x, y - 1), 0f)
+      val wld = max(get(gradientX, x - 1, y + 1), 0f) * max(-get(gradientY, x - 1, y + 1), 0f)
+      val wlm = max(get(gradientX, x - 1, y), 0f) * max(1 - get(gradientY, x - 1, y).abs, 0f)
+      val wlu = max(get(gradientX, x - 1, y - 1), 0f) * max(get(gradientY, x - 1, y - 1), 0f)
       
-      // The amount of water in this cell is the current amount of water minus
-      // the amount of water leaving the cell plus the amount of water entering
-      // the cell. Then, some of the water is evaporated.
-      val w =
-        (get(water, x, y) - o.w0 - o.w1 - o.w2 - o.w3 + o0.w3 + o1.w2 + o2.w1 + o3.w0) * (1 - evaporation)
-      // Likewise for the sediment, but without the evaporation.
-      val s =
-        get(sediment, x, y) - o.s0 - o.s1 - o.s2 - o.s3 + o0.s3 + o1.s2 + o2.s1 + o3.s0
+      set(sediment2, x, y, 
+        get(sediment, x + 1, y + 1) * wrd +
+        get(sediment, x + 1, y) * wrm +
+        get(sediment, x + 1, y - 1) * wru +
+        get(sediment, x, y + 1) * wmd +
+        get(sediment, x, y) * wmm +
+        get(sediment, x, y - 1) * wmu +
+        get(sediment, x - 1, y + 1) * wld +
+        get(sediment, x - 1, y) * wlm +
+        get(sediment, x - 1, y - 1) * wlu
+      )
 
-      // Add dissolved sediment back into the terrain if there is more sediment
-      // in the water than the water can carry.
-      val ds = max(0, s - (sedimentCapCoeff * w))
-      set(waterAfter, x, y, w)
-      set(sedimentAfter, x, y, s - ds)
-      set(terrainAfter, x, y, get(terrain, x, y) + ds)
+      set(water2, x, y,
+        get(water, x + 1, y + 1) * wrd +
+        get(water, x + 1, y) * wrm +
+        get(water, x + 1, y - 1) * wru +
+        get(water, x, y + 1) * wmd +
+        get(water, x, y) * wmm +
+        get(water, x, y - 1) * wmu +
+        get(water, x - 1, y + 1) * wld +
+        get(water, x - 1, y) * wlm +
+        get(water, x - 1, y - 1) * wlu
+      )
+    }
 
-    // Swap terrain, water, and sediment buffers.
-    var tmp = terrain
-    terrain = terrainAfter
-    terrainAfter = tmp
-    tmp = water
-    water = waterAfter
-    waterAfter = tmp
+    // Smooth out slopes that are too steep using gaussian blur.
+    parallel2d { (x, y) =>
+      // Evaporate the water while we're at it.
+      set(water2, x, y, get(water2, x, y) * (1 - evaporationRate))
+
+      val slope = hypot(
+        (get(terrain2, x + 1, y) - get(terrain2, x - 1, y)) / 2 / cellSize,
+        (get(terrain2, x, y + 1) - get(terrain2, x, y - 1)) / 2 / cellSize
+      )
+      if slope > reposeSlope then
+        var sum = 0f
+        for wx <- 0 until weightMatrixSize do
+          for wy <- 0 until weightMatrixSize do
+            sum +=
+              blurWeightMatrix(wx + wy * weightMatrixSize) *
+              get(terrain2, x + wx - weightMatrixSize / 2, y + wy - weightMatrixSize / 2)
+        set(terrain, x, y, sum)
+      else
+        set(terrain, x, y, get(terrain2, x, y))
+    }
+
+    var tmp = water
+    water = water2
+    water2 = tmp
+
     tmp = sediment
-    sediment = sedimentAfter
-    sedimentAfter = tmp
+    sediment = sediment2
+    sediment2 = tmp
+
+    println(s"$iter / $iterations")
 
   terrain

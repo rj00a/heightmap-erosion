@@ -1,5 +1,6 @@
 /before.png
 /after.png
+/old
 
 .dotty-ide*
 bin/
