@@ -1,12 +1,10 @@
-A parallel "unvectorized" implementation of the erosion simulation code by Daniel Andrino. The code is written in Scala 3, but it should be easy enough to port to other languages.
+A parallel "unvectorized" Rust implementation of the erosion simulation code by Daniel Andrino.
+Running this program will create (or truncate) `before.png` and `after.png` in the current working directory.
 
 For more information, see the [original repository](https://github.com/dandrino/terrain-erosion-3-ways).
 
+## Time-lapse
 https://user-images.githubusercontent.com/31678482/114995429-a94f8580-9e52-11eb-9b54-91919fb68b8b.mp4
-
-## Running the Code
-Do `sbt run`.  
-`before.png` and `after.png` will be created in the current working directory. 
 
 ## Learning Resources
 
